@@ -1,0 +1,519 @@
+"""Stream type classes for tap-qualtrics."""
+
+from __future__ import annotations
+
+import time
+import typing as t
+import copy
+from importlib import resources
+import logging
+import requests
+import zipfile
+import io
+import datetime
+import json
+from typing import Iterable, Mapping
+
+from singer_sdk import typing as th  # JSON Schema typing helpers
+
+from tap_qualtrics.client import QualtricsStream
+
+SCHEMAS_DIR = resources.files(__package__) / "schemas"
+
+StringOrIntegerType = th.CustomType({
+    "type": ["string", "integer"]
+})
+
+BooleanOrStringType = th.CustomType({
+    "type": ["boolean", "string"]
+})
+
+
+class SurveyResponsesStream(QualtricsStream):
+    def __init__(self, tap):
+        super().__init__(tap=tap)
+        self.logger = logging.getLogger(__name__)
+        self._current_context = None
+    
+    def get_url(self, context: dict | None) -> str:
+        """Get stream entity URL.
+
+        Developers override this method to perform dynamic URL generation.
+
+        Args:
+            context: Stream partition or context dictionary.
+
+        Returns:
+            A URL, optionally targeted to a specific partition or context.
+        """
+        url = "".join([self.url_base, self.path or ""])
+        vals = copy.copy(dict(self.config))
+        vals.update(context or {})
+        for k, v in vals.items():
+            search_text = f"{{{k}}}"
+            if search_text in url:
+                url = url.replace(search_text, self._url_encode(v))
+        self._current_context = vals.get('survey_id')
+        logging.info(f'CURRENT CONTEXT: {self._current_context}')
+        return url
+    
+    def prepare_request_payload(
+        self,
+        context: dict | None,
+        next_page_token: t.Any | None,
+    ) -> (
+        Iterable[bytes]
+        | str
+        | bytes
+        | list[tuple[t.Any, t.Any]]
+        | tuple[tuple[t.Any, t.Any]]
+        | Mapping[str, t.Any]
+        | None
+    ):
+        """Prepare the data payload for the HTTP request.
+
+        By default, no payload will be sent (return None).
+
+        Developers may override this method if the API requires a custom payload along
+        with the request. (This is generally not required for APIs which use the
+        HTTP 'GET' method.)
+
+        Args:
+            context: Stream partition or context dictionary.
+            next_page_token: Token, page number or any request argument to request the
+                next page of data.
+        """
+        payload: dict = {}
+        payload['sortByLastModifiedDate'] = "true"
+        starting_date = self.get_starting_timestamp(context) or self.config.get('start_date')
+        payload['startDate'] = starting_date.isoformat() if starting_date else None
+        payload['format'] = "ndjson"
+        logging.info(f"Request payload: {payload}")
+
+        return payload
+
+    def parse_response(self, response:requests.Response) -> t.Iterable[dict]:
+        """Parse the response from the API.
+
+        Args:
+            response: The HTTP response object.
+
+        Returns:
+            An iterable of records parsed from the response.
+        """
+        if response.status_code != 200:
+            self.logger.error(f"Failed to create survey responses export file: {response.status_code}")
+            return []
+
+        data = response.json()
+        records = data.get('responses', [])
+        self.logger.info(f"Fetched {len(records)} records.")
+        self.logger.info(f"Response data: {data}")
+        progress_id = data.get('result', {}).get('progressId')
+        if not progress_id:
+            self.logger.error("No progress ID found in the response.")
+            return []
+    
+        max_attempts = 3
+        attempt = 0
+
+        time.sleep(5) 
+
+        while attempt < max_attempts:
+            attempt += 1
+            self.logger.info(f"Attempt {attempt} to check if the file is ready.")
+
+            file_id = self.is_file_ready(progress_id)
+            if file_id:
+                self.logger.info("File is ready for download.")
+                break
+            
+            self.logger.info("File not ready yet, waiting before retrying...")
+            time.sleep(30)
+        else:
+            self.logger.error("File not ready after maximum attempts.")
+            return []
+
+        # Now we can download the file
+        self.logger.info("File is ready, proceeding to download.")
+        responses_data = self.download_file(self.file_id)
+        if not responses_data:
+            self.logger.error("Failed to download the responses file.")
+            return []
+    
+        self.logger.info(f"Downloaded and parsed responses data")
+        
+        # Extract the actual survey responses
+        responses = responses_data.get('responses', [])
+        self.logger.info(f"Found {len(responses)} survey responses")
+        
+        return responses
+
+    def download_file(self, file_id: str) -> dict | None:
+        """Download the file using the file ID."""
+        url = f"{self.url_base}/API/v3/surveys/{self._current_context}/export-responses/{file_id}/file"
+        headers = self.http_headers
+        headers['x-api-token'] = self.config.get("api_token")
+        
+        try:
+            self.logger.info(f"Downloading file from {url}")
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            # Write the raw zip file to disk
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            survey_id = self.config.get('survey_id', 'unknown')
+            zip_filename = f"qualtrics_export_{survey_id}_{file_id}_{timestamp}.zip"
+            
+            with open(zip_filename, 'wb') as f:
+                f.write(response.content)
+            
+            self.logger.info(f"Downloaded zip file saved as: {zip_filename}")
+            
+            # The response is a zip file containing ndjson
+            return self._extract_ndjson_from_zip(response.content)
+                
+        except requests.RequestException as e:
+            self.logger.error(f"Error downloading file: {e}")
+            return None
+
+    def _extract_ndjson_from_zip(self, zip_content: bytes) -> dict | None:
+        """Extract ndjson data from zip file content."""
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_content)) as zip_file:
+                # List all files in the zip
+                file_list = zip_file.namelist()
+                self.logger.info(f"Files in zip: {file_list}")
+                
+                # Look for JSON file (usually the first or only file)
+                json_file = None
+                for filename in file_list:
+                    if filename.endswith('.json') or filename.endswith('.ndjson'):
+                        json_file = filename
+                        break
+
+                if not json_file and file_list:
+                    # If no .json extension found, try the first file
+                    json_file = file_list[0]
+                
+                if json_file:
+                    with zip_file.open(json_file) as f:
+                        ndjson_content = f.read().decode('utf-8')
+                        
+                        # Save the extracted ndjson content to disk
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        survey_id = self.config.get('survey_id', 'unknown')
+                        ndjson_filename = f"qualtrics_responses_{survey_id}_{timestamp}.ndjson"
+                        # TODO: Remove the local copy
+                        with open(ndjson_filename, 'w', encoding='utf-8') as ndjson_file:
+                            ndjson_file.write(ndjson_content)
+                        
+                        self.logger.info(f"Extracted ndjson file saved as: {ndjson_filename}")
+                        
+                        return self.parse_ndjson_content(ndjson_content)
+                else:
+                    self.logger.error("No suitable file found in zip archive")
+                    return None
+                    
+        except zipfile.BadZipFile as e:
+            self.logger.error(f"Invalid zip file: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting ndjson from zip: {e}")
+            return None
+
+    def parse_ndjson_content(self, ndjson_content: str) -> dict:
+        """Parse ndjson content and convert to response format."""
+        try:
+            responses = []
+            
+            # Split by lines and parse each JSON object
+            for line in ndjson_content.strip().split('\n'):
+                if line.strip():
+                    try:
+                        response = json.loads(line)
+                        responses.append(response)
+                    except json.JSONDecodeError as e:
+                        self.logger.warning(f"Failed to parse JSON line: {line[:100]}... Error: {e}")
+                        continue
+            
+            self.logger.info(f"Parsed {len(responses)} responses from ndjson")
+            return {'responses': responses}
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing ndjson content: {e}")
+            return {'responses': []}
+
+    def is_file_ready(self, progress_id: str) -> bool:
+        """Check if the file is ready for download."""
+        url = f"{self.url_base}/API/v3/surveys/{self._current_context}/export-responses/{progress_id}"
+        self.logger.info(f"Checking if file is ready for progress ID: {progress_id}")
+
+        headers = self.http_headers
+        headers['x-api-token'] = self.config.get("api_token")
+        try: 
+            logging.info(f"Requesting file readiness from {url} with headers {headers}")
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            status = data.get('result', {}).get('status')
+            self.logger.info(f"File status: {status}")
+            if status == 'complete':
+                self.file_id = data.get('result', {}).get('fileId')
+                return True 
+        except requests.RequestException as e:
+            self.logger.error(f"Error checking file readiness: {e}")
+            return False
+    
+    def post_process(
+        self,
+        row: dict,
+        context: dict | None = None,  # noqa: ARG002
+    ) -> dict | None:
+        """As needed, append or transform raw data to match expected structure.
+
+        Args:
+            row: An individual record from the stream.
+            context: The stream context.
+
+        Returns:
+            The updated record dictionary, or ``None`` to skip the record.
+        """
+        row['last_modified_date'] = row.get('values', {}).get('_lastModifiedDate')
+        return row
+
+    name = "survey_responses"
+    primary_keys = ["responseId"]
+    replication_key = "last_modified_date"
+    path = "/API/v3/surveys/{survey_id}/export-responses"
+    rest_method = "POST"
+    records_jsonpath = "$[*]"
+
+    schema = th.PropertiesList(
+        # Top-level response identifier
+        th.Property("responseId", th.StringType, description="Unique identifier for the survey response"),
+        th.Property("last_modified_date", th.DateTimeType, description="Last modified date of the response"),
+        
+        # Values object - Core response metadata (allows any additional properties)
+        th.Property("values", th.ObjectType(
+            additional_properties=True
+        ), description="Survey response values and metadata"),
+        
+        # Labels object - Human-readable labels for responses (allows any additional properties)
+        th.Property("labels", th.ObjectType(
+            additional_properties=True
+        ), description="Human-readable labels for response values"),
+        
+        # Survey display metadata
+        th.Property("displayedFields", th.ArrayType(th.StringType), description="Fields that were displayed to the respondent"),
+        th.Property("displayedValues", th.ObjectType(
+            additional_properties=True
+        ), description="Possible values for displayed fields"),
+    ).to_dict()
+
+class SurveyResponsesInProgressStream(SurveyResponsesStream):
+    def __init__(self, tap):
+        super().__init__(tap=tap)
+        self.logger = logging.getLogger(__name__)
+    
+    def prepare_request_payload(
+        self,
+        context: dict | None,
+        next_page_token: t.Any | None,
+    ) -> (
+        Iterable[bytes]
+        | str
+        | bytes
+        | list[tuple[t.Any, t.Any]]
+        | tuple[tuple[t.Any, t.Any]]
+        | Mapping[str, t.Any]
+        | None
+    ):
+        """Prepare the data payload for the HTTP request.
+        Args:
+            context: Stream partition or context dictionary.
+            next_page_token: Token, page number or any request argument to request the
+                next page of data.
+        """
+        payload: dict = {}
+        payload['exportResponsesInProgress'] = "true"
+        payload['startDate'] = self.config.get('start_date')
+        payload['format'] = "ndjson"  # Example format parameter
+        logging.info(f"Request payload: {payload}")
+
+        return payload
+                
+    name = "survey_responses_in_progress"
+    primary_keys = ["responseId"]
+    replication_key = None
+    rest_method = "POST"
+    records_jsonpath = "$[*]"
+    schema = th.PropertiesList(
+        # Top-level response identifier
+        th.Property("responseId", th.StringType, description="Unique identifier for the survey response"),
+        
+        # Values object - Core response metadata (allows any additional properties)
+        th.Property("values", th.ObjectType(
+            additional_properties=True
+        ), description="Survey response values and metadata"),
+        
+        # Labels object - Human-readable labels for responses (allows any additional properties)
+        th.Property("labels", th.ObjectType(
+            additional_properties=True
+        ), description="Human-readable labels for response values"),
+        
+        # Survey display metadata
+        th.Property("displayedFields", th.ArrayType(th.StringType), description="Fields that were displayed to the respondent"),
+        th.Property("displayedValues", th.ObjectType(
+            additional_properties=True
+        ), description="Possible values for displayed fields"),
+    ).to_dict()
+
+    def post_process(
+        self,
+        row: dict,
+        context: dict | None = None,  # noqa: ARG002
+    ) -> dict | None:
+        """As needed, append or transform raw data to match expected structure.
+
+        Args:
+            row: An individual record from the stream.
+            context: The stream context.
+
+        Returns:
+            The updated record dictionary, or ``None`` to skip the record.
+        """
+        return row
+class SurveyQuestionsStream(QualtricsStream):
+    """Stream for Qualtrics survey questions."""
+    
+    def __init__(self, tap):
+        super().__init__(tap=tap)
+        self.logger = logging.getLogger(__name__)
+    
+
+    name = "survey_questions"
+    primary_keys = ["QuestionID"]
+    path = "/API/v3/survey-definitions/{survey_id}/questions"
+    rest_method = "GET"
+    records_jsonpath = "$[result][elements][*]"
+
+    schema = th.PropertiesList(
+        # Core question identifiers
+        th.Property("QuestionID", th.StringType, description="Unique identifier for the question"),
+        th.Property("survey_id", th.StringType, description="Survey ID this question belongs to"),
+        
+        # Question metadata
+        th.Property("QuestionType", th.StringType, description="Type of question (MC, TE, Matrix, DB, etc.)"),
+        th.Property("Selector", th.StringType, description="Question selector/subtype (TB, ML, SACOL, etc.)"),
+        th.Property("SubSelector", th.StringType, description="Question sub-selector (TX, etc.)"),
+        th.Property("QuestionDescription", th.StringType, description="Question description/title"),
+        th.Property("QuestionText", th.StringType, description="The actual question text"),
+        th.Property("DataExportTag", th.StringType, description="Data export tag for the question"),
+        th.Property("DefaultChoices", th.BooleanType, description="Whether to use default choices"),
+        th.Property("DataVisibility", th.ObjectType(
+            th.Property("Private", th.BooleanType, description="Private visibility setting"),
+            th.Property("Hidden", th.BooleanType, description="Hidden visibility setting"),
+        ), description="Data visibility settings"),
+        
+        # Question configuration
+        th.Property("Validation", th.ObjectType(), description="Question validation settings"),
+        th.Property("GradingData", th.ArrayType(th.ObjectType()), description="Grading configuration for the question"),
+        th.Property("Language", th.ArrayType(th.ObjectType()), description="Language-specific question data"),
+        th.Property("NextChoiceId", th.IntegerType, description="Next available choice ID"),
+        th.Property("NextAnswerId", th.IntegerType, description="Next available answer ID"),
+        
+        # Question choices/answers - Updated based on actual data structure
+        th.Property("Choices", th.ObjectType(), description="Available choices for the question"),
+        th.Property("ChoiceOrder", th.ArrayType(StringOrIntegerType), description="Order of choices"),
+        th.Property("Answers", th.ObjectType(), description="Available answers for matrix questions"),
+        th.Property("AnswerOrder", th.ArrayType(StringOrIntegerType), description="Order of answers"),
+        
+        # Display and behavior settings
+        th.Property("RecodeValues", th.ObjectType(), description="Recode values for choices"),
+        th.Property("ChoiceDataExportTags", th.BooleanType, description="Data export tags for choices"),
+        th.Property("VariableNaming", th.ObjectType(), description="Variable naming configuration"),
+        th.Property("ColumnSubQuestion", th.BooleanType, description="Whether this is a column sub-question"),
+        
+        # Question flow and logic
+        th.Property("QuestionJS", BooleanOrStringType, description="JavaScript code for the question"),
+        th.Property("DisplayLogic", th.ObjectType(), description="Display logic configuration"),
+        th.Property("ChoiceRandomization", th.ObjectType(), description="Choice randomization settings"),
+        
+        # Additional configuration - Updated based on actual data structure
+        th.Property("Configuration", th.ObjectType(), description="Additional question configuration"),
+        
+        # Question metadata - Updated based on actual data structure
+        th.Property("QuestionInstructionText", th.StringType, description="Instruction text for the question"),
+        th.Property("SearchSource", th.ObjectType(), description="Search source configuration"),
+        th.Property("DynamicChoices", th.ObjectType(), description="Dynamic choices configuration"),
+        
+        # Experimental or advanced features
+        th.Property("AddOnProperties", th.ObjectType(), description="Add-on properties"),
+        th.Property("AnalyzeChoices", th.ObjectType(), description="Analysis choices configuration"),
+        
+        # Question grouping and organization
+        th.Property("Block", th.StringType, description="Block ID this question belongs to"),
+        th.Property("QuestionNumber", th.IntegerType, description="Question number in survey"),
+    ).to_dict()
+
+class SurveyDefinitionStream(QualtricsStream):
+    """Stream for Qualtrics survey definitions."""
+    
+    def __init__(self, tap):
+        super().__init__(tap=tap)
+        self.logger = logging.getLogger(__name__)
+    
+
+    name = "survey_definition"
+    primary_keys = ["SurveyID"]
+    path = "/API/v3/survey-definitions/{survey_id}"
+    rest_method = "GET"
+    records_jsonpath = "$[result][*]"
+
+    schema = th.PropertiesList(
+        # Core survey identifiers
+        th.Property("SurveyID", th.StringType, description="Unique identifier for the survey"),
+        th.Property("SurveyName", th.StringType, description="Name of the survey"),
+        th.Property("SurveyStatus", th.StringType, description="Status of the survey (Active, Inactive, etc.)"),
+        th.Property("BrandID", th.StringType, description="Brand ID associated with the survey"),
+        th.Property("OwnerID", th.StringType, description="Owner ID of the survey"),
+        th.Property("CreatorID", th.StringType, description="Creator ID of the survey"),
+        th.Property("BrandBaseURL", th.StringType, description="Base URL for the brand"),
+        
+        # Survey metadata
+        th.Property("QuestionCount", StringOrIntegerType, description="Total number of questions in the survey"),
+        th.Property("LastModified", th.DateTimeType, description="Last modified date of the survey"),
+        th.Property("LastAccessed", th.DateTimeType, description="Last accessed date of the survey"),
+        th.Property("LastActivated", th.DateTimeType, description="Last activated date of the survey"),
+        
+        # Top-level objects with flexible structure
+        th.Property("SurveyOptions", th.ObjectType(
+            additional_properties=True
+        ), description="Survey options and configuration"),
+        
+        th.Property("Questions", th.ObjectType(
+            additional_properties=True
+        ), description="All questions in the survey"),
+        
+        th.Property("Blocks", th.ObjectType(
+            additional_properties=True
+        ), description="Survey blocks configuration"),
+        
+        th.Property("ResponseSets", th.ObjectType(
+            additional_properties=True
+        ), description="Response sets configuration"),
+        
+        th.Property("SurveyFlow", th.ObjectType(
+            additional_properties=True
+        ), description="Survey flow configuration"),
+        
+        th.Property("Scoring", th.ObjectType(
+            additional_properties=True
+        ), description="Survey scoring configuration"),
+        
+        th.Property("ProjectInfo", th.ObjectType(
+            additional_properties=True
+        ), description="Project information"),
+        
+    ).to_dict()
