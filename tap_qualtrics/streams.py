@@ -32,7 +32,7 @@ BooleanOrStringType = th.CustomType({
 class SurveyResponsesStream(QualtricsStream):
     def __init__(self, tap):
         super().__init__(tap=tap)
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
         self._current_context = None
     
     def get_url(self, context: dict | None) -> str:
@@ -72,12 +72,6 @@ class SurveyResponsesStream(QualtricsStream):
     ):
         """Prepare the data payload for the HTTP request.
 
-        By default, no payload will be sent (return None).
-
-        Developers may override this method if the API requires a custom payload along
-        with the request. (This is generally not required for APIs which use the
-        HTTP 'GET' method.)
-
         Args:
             context: Stream partition or context dictionary.
             next_page_token: Token, page number or any request argument to request the
@@ -88,7 +82,7 @@ class SurveyResponsesStream(QualtricsStream):
         starting_date = self.get_starting_timestamp(context) or self.config.get('start_date')
         payload['startDate'] = starting_date.isoformat() if starting_date else None
         payload['format'] = "ndjson"
-        logging.info(f"Request payload: {payload}")
+        self.logger.info(f"Request payload: {payload}")
 
         return payload
 
@@ -101,46 +95,74 @@ class SurveyResponsesStream(QualtricsStream):
         Returns:
             An iterable of records parsed from the response.
         """
+        data = self._validate_initial_response(response)
+        progress_id = self._extract_progress_id(data)
+        file_id = self._wait_for_file_ready(progress_id)
+        return self._download_and_extract_responses(file_id)
+
+    def _validate_initial_response(self, response: requests.Response) -> dict:
         if response.status_code != 200:
             self.logger.error(f"Failed to create survey responses export file: {response.status_code}")
-            return []
+            raise ValueError(f"Invalid response from API: {response.status_code}")
 
-        data = response.json()
-        records = data.get('responses', [])
-        self.logger.info(f"Fetched {len(records)} records.")
-        self.logger.info(f"Response data: {data}")
-        progress_id = data.get('result', {}).get('progressId')
+        try:
+            data = response.json()
+        except ValueError as e:
+            self.logger.error(f"Failed to parse JSON response: {e}")
+            raise ValueError("Invalid JSON response from API")
+            
+        return data
+
+    def _extract_progress_id(self, data: dict) -> str | None:
+        return data.get('result', {}).get('progressId')
+
+    def _wait_for_file_ready(self, progress_id: str | None) -> str | None:
         if not progress_id:
-            self.logger.error("No progress ID found in the response.")
-            return []
-    
-        max_attempts = 3
-        attempt = 0
+            self.logger.error("No progress ID found.")
+            return None
 
-        time.sleep(5) 
+        try:
+            max_attempts = self.config.get("max_file_ready_attempts", 3)
+            initial_wait = self.config.get("initial_wait_seconds", 5)
+            retry_wait = self.config.get("retry_wait_seconds", 10)
+            
+            # Ensure they're integers
+            if not isinstance(max_attempts, int):
+                max_attempts = int(max_attempts)
+            if not isinstance(initial_wait, int):
+                initial_wait = int(initial_wait)
+            if not isinstance(retry_wait, int):
+                retry_wait = int(retry_wait)
+                
+        except (ValueError, TypeError) as e:
+            self.logger.error(f"Invalid configuration values: {e}")
+            return None
 
-        while attempt < max_attempts:
-            attempt += 1
-            self.logger.info(f"Attempt {attempt} to check if the file is ready.")
+        attempt = 1
+        time.sleep(initial_wait) 
+
+        while attempt <= max_attempts:
+            self.logger.info(f"Attempt {attempt}/{max_attempts} to check if the file is ready.")
 
             file_id = self.is_file_ready(progress_id)
             if file_id:
                 self.logger.info("File is ready for download.")
-                break
-            
-            self.logger.info("File not ready yet, waiting before retrying...")
-            time.sleep(30)
-        else:
-            self.logger.error("File not ready after maximum attempts.")
-            return []
+                return file_id
 
+            self.logger.info("File not ready yet, waiting before retrying...")
+            attempt += 1
+            time.sleep(retry_wait)
+        self.logger.error(f"File not ready after {max_attempts} attempts.")
+        return None
+
+    def _download_and_extract_responses(self, file_id: str | None) -> dict | None:
         # Now we can download the file
-        self.logger.info("File is ready, proceeding to download.")
-        responses_data = self.download_file(self.file_id)
+        self.logger.info("File is ready, downloading file")
+        responses_data = self.download_file(file_id)
         if not responses_data:
             self.logger.error("Failed to download the responses file.")
-            return []
-    
+            return None
+
         self.logger.info(f"Downloaded and parsed responses data")
         
         # Extract the actual survey responses
@@ -152,25 +174,12 @@ class SurveyResponsesStream(QualtricsStream):
     def download_file(self, file_id: str) -> dict | None:
         """Download the file using the file ID."""
         url = f"{self.url_base}/API/v3/surveys/{self._current_context}/export-responses/{file_id}/file"
-        headers = self.http_headers
-        headers['x-api-token'] = self.config.get("api_token")
         
         try:
             self.logger.info(f"Downloading file from {url}")
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=self.http_headers)
             response.raise_for_status()
             
-            # Write the raw zip file to disk
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            survey_id = self.config.get('survey_id', 'unknown')
-            zip_filename = f"qualtrics_export_{survey_id}_{file_id}_{timestamp}.zip"
-            
-            with open(zip_filename, 'wb') as f:
-                f.write(response.content)
-            
-            self.logger.info(f"Downloaded zip file saved as: {zip_filename}")
-            
-            # The response is a zip file containing ndjson
             return self._extract_ndjson_from_zip(response.content)
                 
         except requests.RequestException as e:
@@ -185,31 +194,20 @@ class SurveyResponsesStream(QualtricsStream):
                 file_list = zip_file.namelist()
                 self.logger.info(f"Files in zip: {file_list}")
                 
-                # Look for JSON file (usually the first or only file)
-                json_file = None
+                # Look for NDJSON file (usually the first or only file)
+                ndjson_file = None
                 for filename in file_list:
-                    if filename.endswith('.json') or filename.endswith('.ndjson'):
-                        json_file = filename
+                    if filename.endswith('.ndjson'):
+                        ndjson_file = filename
                         break
 
-                if not json_file and file_list:
-                    # If no .json extension found, try the first file
-                    json_file = file_list[0]
-                
-                if json_file:
-                    with zip_file.open(json_file) as f:
+                if not ndjson_file and file_list:
+                    # If no .ndjson extension found, try the first file
+                    ndjson_file = file_list[0]
+
+                if ndjson_file:
+                    with zip_file.open(ndjson_file) as f:
                         ndjson_content = f.read().decode('utf-8')
-                        
-                        # Save the extracted ndjson content to disk
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        survey_id = self.config.get('survey_id', 'unknown')
-                        ndjson_filename = f"qualtrics_responses_{survey_id}_{timestamp}.ndjson"
-                        # TODO: Remove the local copy
-                        with open(ndjson_filename, 'w', encoding='utf-8') as ndjson_file:
-                            ndjson_file.write(ndjson_content)
-                        
-                        self.logger.info(f"Extracted ndjson file saved as: {ndjson_filename}")
-                        
                         return self.parse_ndjson_content(ndjson_content)
                 else:
                     self.logger.error("No suitable file found in zip archive")
@@ -227,7 +225,6 @@ class SurveyResponsesStream(QualtricsStream):
         try:
             responses = []
             
-            # Split by lines and parse each JSON object
             for line in ndjson_content.strip().split('\n'):
                 if line.strip():
                     try:
@@ -244,27 +241,26 @@ class SurveyResponsesStream(QualtricsStream):
             self.logger.error(f"Error parsing ndjson content: {e}")
             return {'responses': []}
 
-    def is_file_ready(self, progress_id: str) -> bool:
+    def is_file_ready(self, progress_id: str) -> str | None:
         """Check if the file is ready for download."""
         url = f"{self.url_base}/API/v3/surveys/{self._current_context}/export-responses/{progress_id}"
         self.logger.info(f"Checking if file is ready for progress ID: {progress_id}")
 
         headers = self.http_headers
-        headers['x-api-token'] = self.config.get("api_token")
         try: 
-            logging.info(f"Requesting file readiness from {url} with headers {headers}")
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
             status = data.get('result', {}).get('status')
             self.logger.info(f"File status: {status}")
             if status == 'complete':
-                self.file_id = data.get('result', {}).get('fileId')
-                return True 
+                file_id = data.get('result', {}).get('fileId')
+                return file_id
         except requests.RequestException as e:
             self.logger.error(f"Error checking file readiness: {e}")
-            return False
-    
+            return None
+        return None
+
     def post_process(
         self,
         row: dict,
@@ -280,6 +276,7 @@ class SurveyResponsesStream(QualtricsStream):
             The updated record dictionary, or ``None`` to skip the record.
         """
         row['last_modified_date'] = row.get('values', {}).get('_lastModifiedDate')
+        row['survey_id'] = self._current_context
         return row
 
     name = "survey_responses"
@@ -314,7 +311,7 @@ class SurveyResponsesStream(QualtricsStream):
 class SurveyResponsesInProgressStream(SurveyResponsesStream):
     def __init__(self, tap):
         super().__init__(tap=tap)
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
     
     def prepare_request_payload(
         self,
@@ -338,8 +335,7 @@ class SurveyResponsesInProgressStream(SurveyResponsesStream):
         payload: dict = {}
         payload['exportResponsesInProgress'] = "true"
         payload['startDate'] = self.config.get('start_date')
-        payload['format'] = "ndjson"  # Example format parameter
-        logging.info(f"Request payload: {payload}")
+        payload['format'] = "ndjson" 
 
         return payload
                 
@@ -383,13 +379,15 @@ class SurveyResponsesInProgressStream(SurveyResponsesStream):
         Returns:
             The updated record dictionary, or ``None`` to skip the record.
         """
+        row['survey_id'] = self._current_context
         return row
+
 class SurveyQuestionsStream(QualtricsStream):
     """Stream for Qualtrics survey questions."""
     
     def __init__(self, tap):
         super().__init__(tap=tap)
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
     
 
     name = "survey_questions"
@@ -462,7 +460,7 @@ class SurveyDefinitionStream(QualtricsStream):
     
     def __init__(self, tap):
         super().__init__(tap=tap)
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
     
 
     name = "survey_definition"

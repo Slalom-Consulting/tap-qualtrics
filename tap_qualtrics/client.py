@@ -58,6 +58,7 @@ class QualtricsStream(RESTStream):
         """
         headers = {}
         headers["content-type"] = 'application/json'
+        headers["x-api-token"] = self.config.get("api_token", "")
 
         return headers
     

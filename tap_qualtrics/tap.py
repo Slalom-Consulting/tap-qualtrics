@@ -40,20 +40,38 @@ class TapQualtrics(Tap):
             th.StringType(nullable=False),
             title="Base URL",
             default="https://pdx1.qualtrics.com",
+        ),
+        th.Property(
+            "max_file_ready_attempts",
+            th.StringType(nullable=True),
+            description="The maximum number of attempts to check if a file is ready",
+            default="3"
+        ),
+        th.Property(
+            "initial_wait_seconds",
+            th.StringType(nullable=True),
+            description="The initial wait time before checking if a file is ready",
+            default="5"
+        ),
+        th.Property(
+            "retry_wait_seconds",
+            th.StringType(nullable=True),
+            description="The wait time between retry attempts to check if a file is ready",
+            default="10"
         )
     ).to_dict()
 
-    def discover_streams(self) -> list[streams.qualtricsStream]:
+    def discover_streams(self) -> list[streams.QualtricsStream]:
         """Return a list of discovered streams.
 
         Returns:
             A list of discovered streams.
         """
         return [
-            # streams.SurveyResponsesStream(self),
-            # streams.SurveyResponsesInProgressStream(self),
+            streams.SurveyResponsesStream(self),
+            streams.SurveyResponsesInProgressStream(self),
             streams.SurveyQuestionsStream(self),
-            # streams.SurveyDefinitionStream(self)
+            streams.SurveyDefinitionStream(self)
         ]
 
 
