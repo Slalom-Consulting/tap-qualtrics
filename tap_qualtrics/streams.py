@@ -282,6 +282,7 @@ class SurveyResponsesStream(QualtricsStream):
     name = "survey_responses"
     primary_keys = ["responseId"]
     replication_key = "last_modified_date"
+    is_sorted = True
     path = "/API/v3/surveys/{survey_id}/export-responses"
     rest_method = "POST"
     records_jsonpath = "$[*]"
@@ -290,6 +291,7 @@ class SurveyResponsesStream(QualtricsStream):
         # Top-level response identifier
         th.Property("responseId", th.StringType, description="Unique identifier for the survey response"),
         th.Property("last_modified_date", th.DateTimeType, description="Last modified date of the response"),
+        th.Property("survey_id", th.StringType, description="Survey ID this response belongs to"),
         
         # Values object - Core response metadata (allows any additional properties)
         th.Property("values", th.ObjectType(
@@ -347,6 +349,7 @@ class SurveyResponsesInProgressStream(SurveyResponsesStream):
     schema = th.PropertiesList(
         # Top-level response identifier
         th.Property("responseId", th.StringType, description="Unique identifier for the survey response"),
+        th.Property("survey_id", th.StringType, description="Survey ID this response belongs to"),
         
         # Values object - Core response metadata (allows any additional properties)
         th.Property("values", th.ObjectType(
@@ -412,50 +415,51 @@ class SurveyQuestionsStream(QualtricsStream):
         th.Property("DataVisibility", th.ObjectType(
             th.Property("Private", th.BooleanType, description="Private visibility setting"),
             th.Property("Hidden", th.BooleanType, description="Hidden visibility setting"),
+            additional_properties=True
         ), description="Data visibility settings"),
         
         # Question configuration
-        th.Property("Validation", th.ObjectType(), description="Question validation settings"),
-        th.Property("GradingData", th.ArrayType(th.ObjectType()), description="Grading configuration for the question"),
-        th.Property("Language", th.ArrayType(th.ObjectType()), description="Language-specific question data"),
+        th.Property("Validation", th.ObjectType(additional_properties=True), description="Question validation settings"),
+        th.Property("GradingData", th.ArrayType(th.ObjectType(additional_properties=True)), description="Grading configuration for the question"),
+        th.Property("Language", th.ArrayType(th.ObjectType(additional_properties=True)), description="Language-specific question data"),
         th.Property("NextChoiceId", th.IntegerType, description="Next available choice ID"),
         th.Property("NextAnswerId", th.IntegerType, description="Next available answer ID"),
         
         # Question choices/answers - Updated based on actual data structure
-        th.Property("Choices", th.ObjectType(), description="Available choices for the question"),
+        th.Property("Choices", th.ObjectType(additional_properties=True), description="Available choices for the question"),
         th.Property("ChoiceOrder", th.ArrayType(StringOrIntegerType), description="Order of choices"),
-        th.Property("Answers", th.ObjectType(), description="Available answers for matrix questions"),
+        th.Property("Answers", th.ObjectType(additional_properties=True), description="Available answers for matrix questions"),
         th.Property("AnswerOrder", th.ArrayType(StringOrIntegerType), description="Order of answers"),
         
         # Display and behavior settings
-        th.Property("RecodeValues", th.ObjectType(), description="Recode values for choices"),
+        th.Property("RecodeValues", th.ObjectType(additional_properties=True), description="Recode values for choices"),
         th.Property("ChoiceDataExportTags", th.BooleanType, description="Data export tags for choices"),
-        th.Property("VariableNaming", th.ObjectType(), description="Variable naming configuration"),
+        th.Property("VariableNaming", th.ObjectType(additional_properties=True), description="Variable naming configuration"),
         th.Property("ColumnSubQuestion", th.BooleanType, description="Whether this is a column sub-question"),
         
         # Question flow and logic
         th.Property("QuestionJS", BooleanOrStringType, description="JavaScript code for the question"),
-        th.Property("DisplayLogic", th.ObjectType(), description="Display logic configuration"),
-        th.Property("ChoiceRandomization", th.ObjectType(), description="Choice randomization settings"),
+        th.Property("DisplayLogic", th.ObjectType(additional_properties=True), description="Display logic configuration"),
+        th.Property("ChoiceRandomization", th.ObjectType(additional_properties=True), description="Choice randomization settings"),
         
         # Additional configuration - Updated based on actual data structure
-        th.Property("Configuration", th.ObjectType(), description="Additional question configuration"),
+        th.Property("Configuration", th.ObjectType(additional_properties=True), description="Additional question configuration"),
         
         # Question metadata - Updated based on actual data structure
         th.Property("QuestionInstructionText", th.StringType, description="Instruction text for the question"),
-        th.Property("SearchSource", th.ObjectType(), description="Search source configuration"),
-        th.Property("DynamicChoices", th.ObjectType(), description="Dynamic choices configuration"),
+        th.Property("SearchSource", th.ObjectType(additional_properties=True), description="Search source configuration"),
+        th.Property("DynamicChoices", th.ObjectType(additional_properties=True), description="Dynamic choices configuration"),
         
         # Experimental or advanced features
-        th.Property("AddOnProperties", th.ObjectType(), description="Add-on properties"),
-        th.Property("AnalyzeChoices", th.ObjectType(), description="Analysis choices configuration"),
+        th.Property("AddOnProperties", th.ObjectType(additional_properties=True), description="Add-on properties"),
+        th.Property("AnalyzeChoices", th.ObjectType(additional_properties=True), description="Analysis choices configuration"),
         
         # Question grouping and organization
         th.Property("Block", th.StringType, description="Block ID this question belongs to"),
         th.Property("QuestionNumber", th.IntegerType, description="Question number in survey"),
     ).to_dict()
 
-class SurveyDefinitionStream(QualtricsStream):
+class SurveyDefinitionsStream(QualtricsStream):
     """Stream for Qualtrics survey definitions."""
     
     def __init__(self, tap):
@@ -463,7 +467,7 @@ class SurveyDefinitionStream(QualtricsStream):
         self.logger = logging.getLogger(self.__class__.__name__)
     
 
-    name = "survey_definition"
+    name = "survey_definitions"
     primary_keys = ["SurveyID"]
     path = "/API/v3/survey-definitions/{survey_id}"
     rest_method = "GET"
@@ -472,6 +476,7 @@ class SurveyDefinitionStream(QualtricsStream):
     schema = th.PropertiesList(
         # Core survey identifiers
         th.Property("SurveyID", th.StringType, description="Unique identifier for the survey"),
+        th.Property("survey_id", th.StringType, description="Survey ID this response belongs to"),
         th.Property("SurveyName", th.StringType, description="Name of the survey"),
         th.Property("SurveyStatus", th.StringType, description="Status of the survey (Active, Inactive, etc.)"),
         th.Property("BrandID", th.StringType, description="Brand ID associated with the survey"),

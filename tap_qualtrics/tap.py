@@ -71,7 +71,7 @@ class TapQualtrics(Tap):
             streams.SurveyResponsesStream(self),
             streams.SurveyResponsesInProgressStream(self),
             streams.SurveyQuestionsStream(self),
-            streams.SurveyDefinitionStream(self)
+            streams.SurveyDefinitionsStream(self)
         ]
 
 
