@@ -79,7 +79,7 @@ class QualtricsStream(RESTStream):
         if existing_partitions:
             result = [partition_state["context"] for partition_state in existing_partitions]
         else:
-            survey_ids = self.config.get('survey_ids', [])
+            survey_ids = self.tap.survey_ids
             result = [{"survey_id": survey_id} for survey_id in survey_ids]
         
         logging.info(f'Partitions: {result}')
