@@ -67,21 +67,6 @@ class TapQualtrics(Tap):
         )
     ).to_dict()
 
-    @property
-    def survey_ids(self) -> list[str]:
-        """Get survey IDs as a list, parsing from JSON string if necessary."""
-        survey_ids_config = self.config.get("survey_ids")
-        
-        if isinstance(survey_ids_config, str):
-            try:
-                return json.loads(survey_ids_config)
-            except json.JSONDecodeError as e:
-                self.logger.error(f"Failed to parse survey_ids JSON string: {survey_ids_config}")
-                raise ValueError(f"Invalid JSON format for survey_ids: {e}")
-        elif isinstance(survey_ids_config, list):
-            return survey_ids_config
-        else:
-            raise ValueError(f"survey_ids must be either a list or a JSON string, got {type(survey_ids_config)}")
 
     def discover_streams(self) -> list[streams.QualtricsStream]:
         """Return a list of discovered streams.
