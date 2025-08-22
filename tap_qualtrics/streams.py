@@ -438,7 +438,6 @@ class SurveyQuestionsStream(QualtricsStream):
         th.Property("ColumnSubQuestion", th.BooleanType, description="Whether this is a column sub-question"),
         
         # Question flow and logic
-        th.Property("QuestionJS", BooleanOrStringType, description="JavaScript code for the question"),
         th.Property("DisplayLogic", th.ObjectType(additional_properties=True), description="Display logic configuration"),
         th.Property("ChoiceRandomization", th.ObjectType(additional_properties=True), description="Choice randomization settings"),
         
