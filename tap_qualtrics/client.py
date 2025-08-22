@@ -5,7 +5,6 @@ from __future__ import annotations
 import typing as t
 
 import base64
-import json
 import urllib.parse
 import sys
 import logging
@@ -36,22 +35,6 @@ class QualtricsStream(RESTStream):
     """Qualtrics stream class."""
 
     @property
-    def survey_ids(self) -> list[str]:
-        """Get survey IDs as a list, parsing from JSON string if necessary."""
-        survey_ids_config = self.config.get("survey_ids")
-        
-        if isinstance(survey_ids_config, str):
-            try:
-                return json.loads(survey_ids_config)
-            except json.JSONDecodeError as e:
-                self.logger.error(f"Failed to parse survey_ids JSON string: {survey_ids_config}")
-                raise ValueError(f"Invalid JSON format for survey_ids: {e}")
-        elif isinstance(survey_ids_config, list):
-            return survey_ids_config
-        else:
-            raise ValueError(f"survey_ids must be either a list or a JSON string, got {type(survey_ids_config)}")
-
-    @property
     def url_base(self) -> str:
         """Return the API URL root, configurable via tap settings."""
         return self.config.get("url_base")
@@ -77,6 +60,18 @@ class QualtricsStream(RESTStream):
         headers["x-api-token"] = self.config.get("api_token", "")
 
         return headers
+
+    @property
+    def survey_ids(self) -> list[str]:
+        """Get survey IDs as a list, parsing from comma-separated string."""
+        survey_ids_config = self.config.get("survey_ids")
+        
+        if isinstance(survey_ids_config, str):
+            return [survey_id.strip() for survey_id in survey_ids_config.split(",") if survey_id.strip()]
+        elif isinstance(survey_ids_config, list):
+            return survey_ids_config
+        else:
+            raise ValueError(f"survey_ids must be either a list or a comma-separated string, got {type(survey_ids_config)}")
     
     @property
     def partitions(self) -> list[dict] | None:
@@ -97,6 +92,7 @@ class QualtricsStream(RESTStream):
         else:
             partition_result = []
             
+        # Get survey IDs from tap (no parentheses - it's a property!)
         config_survey_ids = self.survey_ids
         config_survey_result = [{"survey_id": survey_id} for survey_id in config_survey_ids]
 

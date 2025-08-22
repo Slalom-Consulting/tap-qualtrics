@@ -26,15 +26,10 @@ class TapQualtrics(Tap):
         ),
         th.Property(
             "survey_ids",
-            th.CustomType({
-                "anyOf": [
-                    {"type": "array", "items": {"type": "string"}},
-                    {"type": "string"}
-                ]
-            }),
+            th.StringType(nullable=False),
             required=True,
             title="Survey IDs",
-            description="Survey IDs to replicate (can be an array of strings or a JSON string)",
+            description="Survey IDs to replicate (comma-separated string)",
         ),
         th.Property(
             "start_date",
