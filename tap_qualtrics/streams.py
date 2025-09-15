@@ -280,7 +280,7 @@ class SurveyResponsesStream(QualtricsStream):
         return row
 
     name = "survey_responses"
-    primary_keys = ["responseId"]
+    primary_keys = ["responseId","survey_id"]
     replication_key = "last_modified_date"
     is_sorted = True
     path = "/API/v3/surveys/{survey_id}/export-responses"
@@ -342,7 +342,7 @@ class SurveyResponsesInProgressStream(SurveyResponsesStream):
         return payload
                 
     name = "survey_responses_in_progress"
-    primary_keys = ["responseId"]
+    primary_keys = ["responseId","survey_id"]
     replication_key = None
     rest_method = "POST"
     records_jsonpath = "$[*]"
@@ -394,7 +394,7 @@ class SurveyQuestionsStream(QualtricsStream):
     
 
     name = "survey_questions"
-    primary_keys = ["QuestionID"]
+    primary_keys = ["QuestionID","survey_id"]
     path = "/API/v3/survey-definitions/{survey_id}/questions"
     rest_method = "GET"
     records_jsonpath = "$[result][elements][*]"
