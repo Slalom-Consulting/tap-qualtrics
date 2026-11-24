@@ -131,6 +131,36 @@ class QualtricsStream(RESTStream):
         """
         yield from extract_jsonpath(self.records_jsonpath, input=response.json())
 
+    def get_records(self, context: dict | None) -> Iterable[dict]:
+        """Return records, skipping any that lack a source primary key value.
+
+        Qualtrics can export content-less partial responses with no ``responseId``.
+        Targets reject records without a primary key and abort the whole sync, so a
+        single such record would fail every run while it exists in the source. Keys
+        supplied by the partition context (``survey_id``) are filled in later by
+        ``post_process`` and are not checked here.
+
+        Args:
+            context: Stream partition or context dictionary.
+
+        Yields:
+            Each record that carries a value for every source primary key.
+        """
+        source_keys = [k for k in self.primary_keys or [] if k not in (context or {})]
+        for record in super().get_records(context):
+            missing = [k for k in source_keys if record.get(k) in (None, "")]
+            if missing:
+                # Log keys only; response contents are sensitive.
+                self.logger.warning(
+                    "Skipping %s record with no value for primary key(s) %s "
+                    "(context: %s)",
+                    self.name,
+                    missing,
+                    context,
+                )
+                continue
+            yield record
+
 
 
     
