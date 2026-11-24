@@ -13,8 +13,10 @@ import io
 import datetime
 import json
 from typing import Iterable, Mapping
+from urllib.parse import ParseResult, parse_qsl
 
 from singer_sdk import typing as th  # JSON Schema typing helpers
+from singer_sdk.pagination import BaseHATEOASPaginator
 
 from tap_qualtrics.client import QualtricsStream
 
@@ -518,4 +520,141 @@ class SurveyDefinitionsStream(QualtricsStream):
             additional_properties=True
         ), description="Project information"),
         
+    ).to_dict()
+
+
+class QualtricsNextPagePaginator(BaseHATEOASPaginator):
+    """Follow the absolute ``result.nextPage`` URL that list endpoints return."""
+
+    def get_next_url(self, response: requests.Response) -> str | None:
+        return response.json().get("result", {}).get("nextPage")
+
+
+class QualtricsPaginatedStream(QualtricsStream):
+    """Base for list endpoints paginated through ``result.nextPage``."""
+
+    rest_method = "GET"
+    records_jsonpath = "$.result.elements[*]"
+
+    def get_new_paginator(self) -> QualtricsNextPagePaginator:
+        return QualtricsNextPagePaginator()
+
+    def get_url_params(
+        self,
+        context: dict | None,
+        next_page_token: ParseResult | None,
+    ) -> dict[str, t.Any]:
+        # nextPage already carries every query parameter, including skipToken.
+        if next_page_token:
+            return dict(parse_qsl(next_page_token.query))
+        return self.get_first_page_params(context)
+
+    def get_first_page_params(self, context: dict | None) -> dict[str, t.Any]:  # noqa: ARG002
+        return {}
+
+
+class DistributionsStream(QualtricsPaginatedStream):
+    """Email distributions (invites, reminders, thank-yous) sent for a survey.
+
+    The list endpoint has no modified-date filter, so every run lists all of a
+    survey's distributions. ``modifiedDate`` is the replication key only so the
+    history child stream can skip distributions unchanged since the last run.
+    """
+
+    name = "distributions"
+    path = "/API/v3/distributions"
+    primary_keys = ["id"]
+    replication_key = "modifiedDate"
+    is_sorted = False
+
+    schema = th.PropertiesList(
+        th.Property("id", th.StringType, description="Distribution ID (EMD_...)"),
+        th.Property("survey_id", th.StringType, description="Survey ID this distribution belongs to"),
+        th.Property("parentDistributionId", th.StringType, description="Initial invite this reminder or thank-you follows"),
+        th.Property("ownerId", th.StringType, description="User ID of the distribution owner"),
+        th.Property("organizationId", th.StringType, description="Organization or brand ID"),
+        th.Property("requestStatus", th.StringType, description="Pending, Done, Generated, or Error"),
+        th.Property("requestType", th.StringType, description="Invite, Reminder, ThankYou, or GeneratedInvite"),
+        th.Property("sendDate", th.DateTimeType, description="When the distribution was or will be sent"),
+        th.Property("createdDate", th.DateTimeType, description="When the distribution was created"),
+        th.Property("modifiedDate", th.DateTimeType, description="When the distribution was last modified"),
+        th.Property("customHeaders", th.ObjectType(additional_properties=True), description="Custom email headers"),
+        th.Property("headers", th.ObjectType(additional_properties=True), description="Sender and subject of the email"),
+        th.Property("recipients", th.ObjectType(
+            th.Property("mailingListId", th.StringType),
+            th.Property("contactId", th.StringType),
+            th.Property("libraryId", th.StringType),
+            th.Property("sampleId", th.StringType),
+            additional_properties=True,
+        ), description="Contact, mailing list, or sample the distribution targets"),
+        th.Property("message", th.ObjectType(additional_properties=True), description="Library message used for the email body"),
+        th.Property("surveyLink", th.ObjectType(
+            th.Property("surveyId", th.StringType),
+            th.Property("expirationDate", th.DateTimeType),
+            th.Property("linkType", th.StringType),
+            additional_properties=True,
+        ), description="Survey link settings for the distribution"),
+        th.Property("embeddedData", th.ObjectType(additional_properties=True), description="Embedded data sent with the distribution"),
+        th.Property("stats", th.ObjectType(
+            *(th.Property(k, th.IntegerType) for k in (
+                "sent", "failed", "started", "bounced", "opened",
+                "skipped", "finished", "complaints", "blocked",
+            )),
+            additional_properties=True,
+        ), description="Email and survey event counts for the distribution"),
+    ).to_dict()
+
+    def get_first_page_params(self, context: dict | None) -> dict[str, t.Any]:
+        return {"surveyId": (context or {})["survey_id"]}
+
+    def generate_child_contexts(
+        self,
+        record: dict,
+        context: dict | None,
+    ) -> Iterable[dict | None]:
+        """Request history only where it can exist and may have changed.
+
+        Pending distributions have not been sent, so their history is empty.
+        Others are skipped when unmodified since the bookmark (or start_date).
+        """
+        if record.get("requestStatus") == "Pending":
+            return
+        since = self.get_starting_timestamp(context)
+        modified = record.get("modifiedDate")
+        if since and modified and datetime.datetime.fromisoformat(
+            modified.replace("Z", "+00:00")
+        ) <= since:
+            return
+        yield {"survey_id": (context or {})["survey_id"], "distribution_id": record["id"]}
+
+
+class DistributionHistoryStream(QualtricsPaginatedStream):
+    """Per-contact delivery and response history of a distribution.
+
+    Links a contact to its survey session (``surveySessionId``, the FS_ ID of
+    in-progress responses) and completed response (``responseId``).
+    """
+
+    name = "distribution_history"
+    parent_stream_type = DistributionsStream
+    path = "/API/v3/distributions/{distribution_id}/history"
+    primary_keys = ["distributionId", "contactId"]
+    replication_key = None
+    # Keep state per survey rather than one entry per distribution.
+    state_partitioning_keys = ["survey_id"]
+
+    schema = th.PropertiesList(
+        th.Property("distributionId", th.StringType, description="Distribution ID (EMD_...)"),
+        th.Property("contactId", th.StringType, description="XM Directory contact ID (CID_...)"),
+        th.Property("survey_id", th.StringType, description="Survey ID the distribution belongs to"),
+        th.Property("contactLookupId", th.StringType, description="Mailing-list lookup ID of the contact"),
+        th.Property("contactFrequencyRuleId", th.StringType, description="Contact frequency rule that applied, if any"),
+        th.Property("status", th.StringType, description="Latest delivery or survey status, for example Success or SurveyFinished"),
+        th.Property("sentAt", th.DateTimeType, description="When the email was sent"),
+        th.Property("openedAt", th.DateTimeType, description="When the email was opened"),
+        th.Property("responseStartedAt", th.DateTimeType, description="When the contact started the survey"),
+        th.Property("responseCompletedAt", th.DateTimeType, description="When the contact finished the survey"),
+        th.Property("surveySessionId", th.StringType, description="Survey session ID (FS_...), matches in-progress responseId"),
+        th.Property("responseId", th.StringType, description="Completed response ID (R_...)"),
+        th.Property("surveyLink", th.StringType, description="The contact's personal survey link; treat as a credential"),
     ).to_dict()
