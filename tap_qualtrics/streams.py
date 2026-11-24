@@ -658,3 +658,21 @@ class DistributionHistoryStream(QualtricsPaginatedStream):
         th.Property("responseId", th.StringType, description="Completed response ID (R_...)"),
         th.Property("surveyLink", th.StringType, description="The contact's personal survey link; treat as a credential"),
     ).to_dict()
+
+    def validate_response(self, response: requests.Response) -> None:
+        # Some sent distributions permanently return 404 CP_GW_LD_NOT_FOUND for their
+        # history; treat that as "no history" instead of failing the whole stream.
+        if response.status_code == 404:
+            return
+        super().validate_response(response)
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        if response.status_code == 404:
+            error = response.json().get("meta", {}).get("error", {}).get("errorCode")
+            self.logger.warning(
+                "No history available for %s (404 %s); skipping",
+                response.request.path_url,
+                error,
+            )
+            return
+        yield from super().parse_response(response)
