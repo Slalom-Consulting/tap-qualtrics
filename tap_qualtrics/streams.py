@@ -659,20 +659,36 @@ class DistributionHistoryStream(QualtricsPaginatedStream):
         th.Property("surveyLink", th.StringType, description="The contact's personal survey link; treat as a credential"),
     ).to_dict()
 
+    # Responses that mean "this distribution has no retrievable history", not an
+    # error with the sync: sent distributions whose history permanently 404s with
+    # CP_GW_LD_NOT_FOUND, and TestEmail distributions, which return 400
+    # EMAIL_DISTRIBUTION_NO_RECIPIENTS ("This distribution type may be unsupported").
+    # Anything else (auth, rate limits, other 4xx/5xx) still fails the stream.
+    NO_HISTORY_400_CODES = frozenset({"EMAIL_DISTRIBUTION_NO_RECIPIENTS"})
+
+    def _no_history_reason(self, response: requests.Response) -> str | None:
+        if response.status_code not in (400, 404):
+            return None
+        try:
+            code = response.json().get("meta", {}).get("error", {}).get("errorCode")
+        except ValueError:
+            code = None
+        if response.status_code == 404 or code in self.NO_HISTORY_400_CODES:
+            return f"{response.status_code} {code}"
+        return None
+
     def validate_response(self, response: requests.Response) -> None:
-        # Some sent distributions permanently return 404 CP_GW_LD_NOT_FOUND for their
-        # history; treat that as "no history" instead of failing the whole stream.
-        if response.status_code == 404:
+        if self._no_history_reason(response):
             return
         super().validate_response(response)
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        if response.status_code == 404:
-            error = response.json().get("meta", {}).get("error", {}).get("errorCode")
+        reason = self._no_history_reason(response)
+        if reason:
             self.logger.warning(
-                "No history available for %s (404 %s); skipping",
+                "No history available for %s (%s); skipping",
                 response.request.path_url,
-                error,
+                reason,
             )
             return
         yield from super().parse_response(response)
