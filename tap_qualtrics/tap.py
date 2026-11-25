@@ -59,7 +59,17 @@ class TapQualtrics(Tap):
             th.StringType(nullable=True),
             description="The wait time between retry attempts to check if a file is ready",
             default="10"
-        )
+        ),
+        th.Property(
+            "mailing_lists",
+            th.StringType(nullable=True),
+            title="Mailing lists",
+            description=(
+                "XM Directory mailing lists for the mailing_list_contacts stream, as a "
+                "comma-separated string of directoryId/mailingListId pairs "
+                "(POOL_.../CG_...)"
+            ),
+        ),
     ).to_dict()
 
 
@@ -76,6 +86,7 @@ class TapQualtrics(Tap):
             streams.SurveyDefinitionsStream(self),
             streams.DistributionsStream(self),
             streams.DistributionHistoryStream(self),
+            streams.MailingListContactsStream(self),
         ]
 
 

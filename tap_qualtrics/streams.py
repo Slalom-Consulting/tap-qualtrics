@@ -552,6 +552,39 @@ class QualtricsPaginatedStream(QualtricsStream):
     def get_first_page_params(self, context: dict | None) -> dict[str, t.Any]:  # noqa: ARG002
         return {}
 
+    # (HTTP status, Qualtrics errorCode) pairs that mean "nothing to read here", not a
+    # sync failure. An errorCode of None matches any code for that status. Anything
+    # else (auth, rate limits, other 4xx/5xx) still fails the stream.
+    skippable_errors: frozenset[tuple[int, str | None]] = frozenset()
+
+    def _skip_reason(self, response: requests.Response) -> str | None:
+        if response.ok or not self.skippable_errors:
+            return None
+        try:
+            code = response.json().get("meta", {}).get("error", {}).get("errorCode")
+        except ValueError:
+            code = None
+        status = response.status_code
+        if (status, None) in self.skippable_errors or (status, code) in self.skippable_errors:
+            return f"{status} {code}"
+        return None
+
+    def validate_response(self, response: requests.Response) -> None:
+        if self._skip_reason(response):
+            return
+        super().validate_response(response)
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        reason = self._skip_reason(response)
+        if reason:
+            self.logger.warning(
+                "Nothing to read for %s (%s); skipping",
+                response.request.path_url,
+                reason,
+            )
+            return
+        yield from super().parse_response(response)
+
 
 class DistributionsStream(QualtricsPaginatedStream):
     """Email distributions (invites, reminders, thank-yous) sent for a survey.
@@ -659,36 +692,63 @@ class DistributionHistoryStream(QualtricsPaginatedStream):
         th.Property("surveyLink", th.StringType, description="The contact's personal survey link; treat as a credential"),
     ).to_dict()
 
-    # Responses that mean "this distribution has no retrievable history", not an
-    # error with the sync: sent distributions whose history permanently 404s with
-    # CP_GW_LD_NOT_FOUND, and TestEmail distributions, which return 400
-    # EMAIL_DISTRIBUTION_NO_RECIPIENTS ("This distribution type may be unsupported").
-    # Anything else (auth, rate limits, other 4xx/5xx) still fails the stream.
-    NO_HISTORY_400_CODES = frozenset({"EMAIL_DISTRIBUTION_NO_RECIPIENTS"})
+    # Sent distributions whose history permanently 404s (CP_GW_LD_NOT_FOUND), and
+    # TestEmail distributions, which return 400 EMAIL_DISTRIBUTION_NO_RECIPIENTS
+    # ("This distribution type may be unsupported").
+    skippable_errors = frozenset({(404, None), (400, "EMAIL_DISTRIBUTION_NO_RECIPIENTS")})
 
-    def _no_history_reason(self, response: requests.Response) -> str | None:
-        if response.status_code not in (400, 404):
-            return None
-        try:
-            code = response.json().get("meta", {}).get("error", {}).get("errorCode")
-        except ValueError:
-            code = None
-        if response.status_code == 404 or code in self.NO_HISTORY_400_CODES:
-            return f"{response.status_code} {code}"
-        return None
 
-    def validate_response(self, response: requests.Response) -> None:
-        if self._no_history_reason(response):
+class MailingListContactsStream(QualtricsPaginatedStream):
+    """XM Directory contacts of configured mailing lists, with embedded data.
+
+    Gives every invitee's details (name, email, embedded account and office fields),
+    including people who never responded. ``contactLookupId`` (CGC_) joins
+    ``distributions.recipients.contactId``; ``contactId`` (CID_) joins the ContactID
+    in response values. Lists are small, so each run reads them in full.
+    """
+
+    name = "mailing_list_contacts"
+    path = "/API/v3/directories/{directory_id}/mailinglists/{mailing_list_id}/contacts"
+    primary_keys = ["mailing_list_id", "contactLookupId"]
+    replication_key = None
+    # A list not visible in the configured directory: not shared with the API user yet,
+    # or configured under the wrong directory. A 401 (visible but not permitted) fails.
+    skippable_errors = frozenset({(404, "LIST_CONTACTS_IN_LIST_NOT_FOUND")})
+
+    schema = th.PropertiesList(
+        th.Property("mailing_list_id", th.StringType, description="Mailing list ID (CG_...)"),
+        th.Property("contactLookupId", th.StringType, description="Mailing-list contact lookup ID (CGC_...)"),
+        th.Property("directory_id", th.StringType, description="XM Directory ID (POOL_...)"),
+        th.Property("contactId", th.StringType, description="XM Directory contact ID (CID_...)"),
+        th.Property("firstName", th.StringType, description="Contact first name"),
+        th.Property("lastName", th.StringType, description="Contact last name"),
+        th.Property("email", th.StringType, description="Contact email"),
+        th.Property("phone", th.StringType, description="Contact phone"),
+        th.Property("extRef", th.StringType, description="External data reference"),
+        th.Property("language", th.StringType, description="Contact language"),
+        th.Property("unsubscribed", th.BooleanType, description="Unsubscribed from the directory"),
+        th.Property("mailingListUnsubscribed", th.BooleanType, description="Unsubscribed from this mailing list"),
+        th.Property("embeddedData", th.ObjectType(additional_properties=True), description="Embedded data fields on the contact"),
+    ).to_dict()
+
+    @property
+    def partitions(self) -> list[dict] | None:
+        """One partition per configured ``directoryId/mailingListId`` pair."""
+        pairs = [p.strip() for p in str(self.config.get("mailing_lists") or "").split(",") if p.strip()]
+        result = []
+        for pair in pairs:
+            directory_id, sep, mailing_list_id = pair.partition("/")
+            if not sep or not directory_id or not mailing_list_id:
+                msg = f"mailing_lists entries must be 'POOL_.../CG_...', got {pair!r}"
+                raise ValueError(msg)
+            result.append({"directory_id": directory_id, "mailing_list_id": mailing_list_id})
+        return result or None
+
+    def get_records(self, context: dict | None) -> Iterable[dict]:
+        # No mailing_lists configured: nothing to read (the SDK calls once with None).
+        if not context:
             return
-        super().validate_response(response)
+        yield from super().get_records(context)
 
-    def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        reason = self._no_history_reason(response)
-        if reason:
-            self.logger.warning(
-                "No history available for %s (%s); skipping",
-                response.request.path_url,
-                reason,
-            )
-            return
-        yield from super().parse_response(response)
+    def get_first_page_params(self, context: dict | None) -> dict[str, t.Any]:  # noqa: ARG002
+        return {"includeEmbedded": "true"}
